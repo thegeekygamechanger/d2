@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Advanced Vision Assistant</title>
+    
+    <!-- Load TensorFlow.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow/tfjs@4.16.0"></script>
+    <!-- Load COCO-SSD model -->
+    <script src="https://cdn.jsdelivr.net/npm/@tensorflow-models/coco-ssd@2.2.2"></script>
+
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            background: #000;
+            color: #fff;
+            font-family: Arial, sans-serif;
+        }
+        .container {
+            max-width: 800px;
+            margin: 0 auto;
+        }
+        .video-container {
+            position: relative;
+            margin: 20px 0;
+        }
+        video {
+            width: 100%;
+            border-radius: 10px;
+            background: #111;
+        }
+        canvas {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .button {
+            background: #2196F3;
+            color: white;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
+        }
+        .button:disabled {
+            background: #666;
+        }
+        .status {
+            margin: 10px 0;
+            padding: 10px;
+            background: #333;
+            border-radius: 5px;
+        }
+        .audio-controls {
+            margin: 10px 0;
+        }
+        #volumeControl {
+            width: 200px;
+            margin: 0 10px;
+        }
+        .detection-info {
+            margin-top: 10px;
+            padding: 10px;
+            background: #333;
+            border-radius: 5px;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Advanced Vision Assistant</h1>
+        
+        <div class="video-container">
+            <video id="video" autoplay playsinline muted></video>
+            <canvas id="canvas"></canvas>
+        </div>
+
+        <div>
+            <button id="startBtn" class="button">Start Camera</button>
+            <button id="stopBtn" class="button" disabled>Stop</button>
+        </div>
+
+        <div class="audio-controls">
+            <label>Volume:</label>
+            <input type="range" id="volumeControl" min="0" max="1" step="0.1" value="1">
+            <button id="muteBtn" class="button">Mute Audio</button>
+        </div>
+
+        <div id="status" class="status">Loading model...</div>
+        <div id="detectionInfo" class="detection-info"></div>
+    </div>
+
+    <script>
+        // Core variables
+        let model;
+        let isRunning = false;
+        let isMuted = false;
+        let lastSpokenTime = 0;
+        let lastSpokenObjects = new Map();
+
+        // DOM Elements
+        const video = document.getElementById('video');
+        const canvas = document.getElementById('canvas');
+        const ctx = canvas.getContext('2d');
+        const startBtn = document.getElementById('startBtn');
+        const stopBtn = document.getElementById('stopBtn');
+        const status = document.getElementById('status');
+        const volumeControl = document.getElementById('volumeControl');
+        const muteBtn = document.getElementById('muteBtn');
+        const detectionInfo = document.getElementById('detectionInfo');
+
+        // Initialize speech synthesis
+        const synth = window.speechSynthesis;
+        let voice = null;
+
+        // Set up voice
+        function setupVoice() {
+            const voices = synth.getVoices();
+            voice = voices.find(v => 
+                v.lang === 'en-US' && 
+                (v.name.includes('Google') || v.name.includes('Natural'))
+            ) || voices.find(v => v.lang === 'en-US') || voices[0];
+        }
+
+        if (synth.onvoiceschanged !== undefined) {
+            synth.onvoiceschanged = setupVoice;
+        }
+
+        // Enhanced speak function
+        function speak(text, priority = false) {
+            if (isMuted) return;
+            
+            const now = Date.now();
+            if (!priority && now - lastSpokenTime < 1000) return;
+
+            synth.cancel(); // Cancel any ongoing speech for immediate announcement
+
+            const utterance = new SpeechSynthesisUtterance(text);
+            utterance.voice = voice;
+            utterance.rate = 0.7;
+            utterance.pitch = 0.7;
+            utterance.volume = parseFloat(volumeControl.value);
+            synth.speak(utterance);
+            lastSpokenTime = now;
+        }
+
+        // Get direction of object
+        function getDirection(x, width, canvasWidth) {
+            const center = x + (width / 2);
+            const third = canvasWidth / 3;
+            
+            if (center < third) return "on the left";
+            if (center > third * 2) return "on the right";
+            return "in front";
+        }
+
+        // Estimate distance
+        function estimateDistance(bbox) {
+            const [,, width, height] = bbox;
+            const size = Math.max(width, height);
+            return (500 / size).toFixed(1);
+        }
+
+        // Load model with advanced configuration
+        async function loadModel() {
+            try {
+                model = await cocoSsd.load({
+                    base: 'mobilenet_v2'
+                });
+                
+                startBtn.disabled = false;
+                status.textContent = 'Model loaded - ready to start';
+                speak('Enhanced vision system ready');
+            } catch (error) {
+                status.textContent = 'Error loading model: ' + error;
+                console.error('Model loading error:', error);
+            }
+        }
+
+        // Enhanced detection function
+        async function detectFrame() {
+            if (!isRunning) return;
+
+            try {
+                const predictions = await model.detect(video);
+                ctx.clearRect(0, 0, canvas.width, canvas.height);
+
+                const currentDetections = new Map();
+                let detectionText = '';
+
+                predictions
+                    .filter(pred => pred.score > 0.65)
+                    .sort((a, b) => b.score - a.score)
+                    .forEach(prediction => {
+                        const [x, y, width, height] = prediction.bbox;
+                        const distance = estimateDistance(prediction.bbox);
+                        const direction = getDirection(x, width, canvas.width);
+                        const confidence = Math.round(prediction.score * 100);
+                        
+                        // Draw detection box
+                        ctx.strokeStyle = distance < 2 ? '#ff0000' : 
+                                        distance < 4 ? '#ffa500' : '#00ff00';
+                        ctx.lineWidth = 3;
+                        ctx.strokeRect(x, y, width, height);
+
+                        // Draw label
+                        ctx.fillStyle = `${ctx.strokeStyle}cc`;
+                        ctx.fillRect(x, y - 30, width, 30);
+                        ctx.fillStyle = '#ffffff';
+                        ctx.font = 'bold 16px Arial';
+                        ctx.fillText(
+                            `${prediction.class} ${confidence}% ${distance}m`,
+                            x + 5,
+                            y - 8
+                        );
+
+                        // Add to detection text
+                        detectionText += `${prediction.class} ${direction} at ${distance}m (${confidence}%)\n`;
+
+                        // Handle audio announcement
+                        const key = `${prediction.class}-${direction}-${Math.round(distance)}`;
+                        const now = Date.now();
+                        currentDetections.set(key, now);
+
+                        if (!lastSpokenObjects.has(key) || 
+                            (now - lastSpokenObjects.get(key)) > 1000) {
+                            
+                            const priority = distance < 2 || confidence > 90;
+                            const announcement = 
+                                `${prediction.class} ${direction} at ${distance} meters`;
+                            
+                            speak(announcement, priority);
+                            lastSpokenObjects.set(key, now);
+                        }
+                    });
+
+                // Update detection info
+                detectionInfo.textContent = detectionText || 'No objects detected';
+
+                // Clean up old detections
+                const now = Date.now();
+                for (const [key, time] of lastSpokenObjects.entries()) {
+                    if (!currentDetections.has(key) || (now - time > 1000)) {
+                        lastSpokenObjects.delete(key);
+                    }
+                }
+
+                requestAnimationFrame(detectFrame);
+
+            } catch (error) {
+                console.error('Detection error:', error);
+                if (isRunning) {
+                    requestAnimationFrame(detectFrame);
+                }
+            }
+        }
+
+        // Start camera
+        async function startCamera() {
+            try {
+                const stream = await navigator.mediaDevices.getUserMedia({
+                    video: { 
+                        facingMode: 'environment',
+                        width: { ideal: 1280 },
+                        height: { ideal: 720 }
+                    }
+                });
+
+                video.srcObject = stream;
+                await video.play();
+
+                canvas.width = video.videoWidth;
+                canvas.height = video.videoHeight;
+
+                isRunning = true;
+                startBtn.disabled = true;
+                stopBtn.disabled = false;
+                status.textContent = 'Detection running';
+                speak('Starting detection');
+
+                detectFrame();
+            } catch (error) {
+                status.textContent = 'Error accessing camera: ' + error;
+                console.error('Camera error:', error);
+                speak('Error accessing camera');
+            }
+        }
+
+        // Stop camera
+        function stopCamera() {
+            isRunning = false;
+            const stream = video.srcObject;
+            if (stream) {
+                stream.getTracks().forEach(track => track.stop());
+                video.srcObject = null;
+            }
+            startBtn.disabled = false;
+            stopBtn.disabled = true;
+            status.textContent = 'Detection stopped';
+            speak('Detection stopped');
+            lastSpokenObjects.clear();
+        }
+
+        // Toggle mute
+        muteBtn.addEventListener('click', () => {
+            isMuted = !isMuted;
+            muteBtn.textContent = isMuted ? 'Unmute Audio' : 'Mute Audio';
+            if (isMuted) {
+                synth.cancel();
+            }
+        });
+
+        // Event listeners
+        startBtn.addEventListener('click', startCamera);
+        stopBtn.addEventListener('click', stopCamera);
+        volumeControl.addEventListener('input', () => {
+            if (isMuted) {
+                isMuted = false;
+                muteBtn.textContent = 'Mute Audio';
+            }
+        });
+
+        // Initialize
+        loadModel();
+    </script>
+</body>
+</html>
